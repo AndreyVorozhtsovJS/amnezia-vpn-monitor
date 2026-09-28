@@ -1,0 +1,170 @@
+#!/usr/bin/env bash
+# Collects a point-in-time snapshot of this VPN server as key=value lines.
+# Runs as root via the restricted vpnmon dispatcher. Read-only except for a
+# tiny CPU-counter state file in /run.
+set -u
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+STATE_DIR=/run/vpn-monitor
+mkdir -p "$STATE_DIR" 2>/dev/null && chmod 700 "$STATE_DIR" 2>/dev/null
+
+# ---------------------------------------------------------------------------
+# CPU: average since the previous snapshot (normally ~60 s), not a short
+# sample taken while sshd is still busy handling our own login.
+# Steal time (CPU taken by the hypervisor for other tenants) is reported
+# separately and NOT counted as this server's own load.
+# ---------------------------------------------------------------------------
+read_cpu() {  # -> total idle steal
+  read -r _ u n s i w irq sirq st _ < /proc/stat
+  echo "$((u+n+s+i+w+irq+sirq+st)) $((i+w)) $((st))"
+}
+
+CPU="0.0"; STEAL="0.0"
+cpu_sample() {
+  local now total idle steal prev_ts prev_total prev_idle prev_steal dt
+  now="$(date +%s)"
+  read -r total idle steal < <(read_cpu)
+  if [ -r "$STATE_DIR/cpu" ] && read -r prev_ts prev_total prev_idle prev_steal < "$STATE_DIR/cpu" \
+     && [ -n "${prev_steal:-}" ] \
+     && [ $((now - prev_ts)) -ge 10 ] && [ $((now - prev_ts)) -le 900 ]; then
+    :
+  else
+    prev_total="$total"; prev_idle="$idle"; prev_steal="$steal"
+    sleep 1
+    read -r total idle steal < <(read_cpu)
+  fi
+  echo "$now $total $idle $steal" > "$STATE_DIR/cpu" 2>/dev/null
+  dt=$((total - prev_total))
+  if [ "$dt" -gt 0 ]; then
+    read -r CPU STEAL < <(awk -v dt="$dt" -v di="$((idle - prev_idle))" -v ds="$((steal - prev_steal))" \
+      'BEGIN { busy = (dt - di - ds) / dt * 100; if (busy < 0) busy = 0;
+               printf "%.1f %.1f\n", busy, ds / dt * 100 }')
+  fi
+}
+cpu_sample
+NPROC="$(nproc 2>/dev/null || echo 1)"
+MEM_TOTAL_KB="$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)"
+MEM_AVAIL_KB="$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)"
+MEM_USED_KB=$((MEM_TOTAL_KB-MEM_AVAIL_KB))
+MEM_PCT="$(awk -v u="$MEM_USED_KB" -v t="$MEM_TOTAL_KB" 'BEGIN { if (t>0) printf "%.1f", u/t*100; else print "0.0" }')"
+DISK_PCT="$(df -P / | awk 'NR==2 {gsub("%","",$5); print $5}')"
+DISK_FREE_BYTES="$(df -PB1 / | awk 'NR==2 {print $4}')"
+UPTIME_SECONDS="$(awk '{printf "%.0f", $1}' /proc/uptime)"
+LOAD1="$(awk '{print $1}' /proc/loadavg)"
+REBOOT_REQUIRED=0
+[ -f /var/run/reboot-required ] && REBOOT_REQUIRED=1
+
+NETWORK_INTERFACE="$(ip route show default 2>/dev/null | awk 'NR==1 {print $5}')"
+if [ -n "$NETWORK_INTERFACE" ] && [ -r "/sys/class/net/$NETWORK_INTERFACE/statistics/rx_bytes" ]; then
+  RX_BYTES="$(cat "/sys/class/net/$NETWORK_INTERFACE/statistics/rx_bytes")"
+  TX_BYTES="$(cat "/sys/class/net/$NETWORK_INTERFACE/statistics/tx_bytes")"
+else
+  NETWORK_INTERFACE="all-non-loopback"
+  RX_BYTES="$(awk -F'[: ]+' 'NR>2 && $2 != "lo" {sum += $3} END {printf "%.0f", sum+0}' /proc/net/dev)"
+  TX_BYTES="$(awk -F'[: ]+' 'NR>2 && $2 != "lo" {sum += $11} END {printf "%.0f", sum+0}' /proc/net/dev)"
+fi
+
+# ---------------------------------------------------------------------------
+# VPN containers. `docker ps -a` so that a stopped container shows up as
+# "Exited ..." instead of silently disappearing.
+# ---------------------------------------------------------------------------
+VPN_PATTERN='awg|wireguard|openvpn|cloak|shadowsocks|xray|v2ray|ipsec'
+VPN_NAME=""
+VPN_STATUS="unknown"
+WG_CONTAINERS=""
+CONTAINER_LINES=""
+if command -v docker >/dev/null 2>&1; then
+  DOCKER_PS="$(docker ps -a --format '{{.Names}}|{{.Status}}' 2>/dev/null || true)"
+  CONTAINER_LINES="$(printf '%s\n' "$DOCKER_PS" | grep -Ei "^[^|]*($VPN_PATTERN)" || true)"
+  VPN_LINE=""
+  for pattern in 'awg' 'wireguard' 'openvpn|cloak|shadowsocks' 'xray|v2ray' 'ipsec'; do
+    VPN_LINE="$(printf '%s\n' "$CONTAINER_LINES" | grep -Ei "^[^|]*($pattern)" | head -n1 || true)"
+    [ -n "$VPN_LINE" ] && break
+  done
+  if [ -n "$VPN_LINE" ]; then
+    VPN_NAME="${VPN_LINE%%|*}"
+    VPN_STATUS="${VPN_LINE#*|}"
+  else
+    VPN_STATUS="not_found"
+  fi
+  WG_CONTAINERS="$(printf '%s\n' "$CONTAINER_LINES" | grep -Ei '^[^|]*(awg|wireguard)[^|]*\|Up' \
+    | cut -d'|' -f1 || true)"
+else
+  VPN_STATUS="docker_not_found"
+fi
+
+# ---------------------------------------------------------------------------
+# Peers. Stable across wg/awg:
+#   show all latest-handshakes -> <iface> <pubkey> <unix-ts|0>
+#   show all transfer          -> <iface> <pubkey> <rx> <tx>
+# Output lines (tab separated, parsed by the monitor):
+#   hs=<source>:<iface>\t<pubkey>\t<ts>
+#   tr=<source>:<iface>\t<pubkey>\t<rx>\t<tx>
+#   clients=<source>\t<base64 of Amnezia clientsTable JSON>   (peer names)
+# ---------------------------------------------------------------------------
+WG_SCRIPT='
+for t in awg wg; do
+  if command -v "$t" >/dev/null 2>&1; then
+    "$t" show all latest-handshakes 2>/dev/null | awk "{print \"HS\\t\" \$0}"
+    "$t" show all transfer 2>/dev/null | awk "{print \"TR\\t\" \$0}"
+    break
+  fi
+done
+for f in $(find /opt/amnezia -maxdepth 3 -name clientsTable 2>/dev/null); do
+  printf "CL\t"; base64 < "$f" | tr -d "\n"; echo
+done
+'
+
+RAW=""
+emit_raw() {  # $1 = source label, stdin = WG_SCRIPT output
+  awk -F'\t' -v src="$1" 'BEGIN{OFS="\t"}
+    $1=="HS" && NF>=4 {print "hs=" src ":" $2, $3, $4}
+    $1=="TR" && NF>=5 {print "tr=" src ":" $2, $3, $4, $5}
+    $1=="CL" && NF>=2 {print "clients=" src, $2}'
+}
+
+HOST_RAW="$(sh -c "$WG_SCRIPT" 2>/dev/null | emit_raw host)"
+if printf '%s\n' "$HOST_RAW" | grep -q '^hs='; then
+  RAW="$HOST_RAW"
+else
+  for c in $WG_CONTAINERS; do
+    RAW="$RAW
+$(docker exec "$c" sh -c "$WG_SCRIPT" 2>/dev/null | emit_raw "$c")"
+  done
+fi
+
+NOW="$(date +%s)"
+PEERS_ONLINE="-1"
+PEERS_TOTAL="-1"
+if printf '%s\n' "$RAW" | grep -q '^hs='; then
+  read -r PEERS_TOTAL PEERS_ONLINE < <(printf '%s\n' "$RAW" | awk -F'\t' -v now="$NOW" '
+    /^hs=/ && $3 ~ /^[0-9]+$/ {
+      k = $1 SUBSEP $2
+      if (k in seen) next
+      seen[k] = 1; total++
+      if ($3 > 0 && (now - $3) <= 180) online++
+    }
+    END { printf "%d %d\n", total+0, online+0 }')
+fi
+
+echo "cpu_pct=$CPU"
+echo "steal_pct=$STEAL"
+echo "cpu_count=$NPROC"
+echo "mem_pct=$MEM_PCT"
+echo "mem_used_kb=$MEM_USED_KB"
+echo "mem_total_kb=$MEM_TOTAL_KB"
+echo "disk_pct=$DISK_PCT"
+echo "disk_free_bytes=$DISK_FREE_BYTES"
+echo "load1=$LOAD1"
+echo "uptime_seconds=$UPTIME_SECONDS"
+echo "reboot_required=$REBOOT_REQUIRED"
+echo "now=$NOW"
+echo "network_interface=$NETWORK_INTERFACE"
+echo "rx_bytes=$RX_BYTES"
+echo "tx_bytes=$TX_BYTES"
+echo "vpn_name=$VPN_NAME"
+echo "vpn_status=$VPN_STATUS"
+echo "peers_online=$PEERS_ONLINE"
+echo "peers_total=$PEERS_TOTAL"
+printf '%s\n' "$CONTAINER_LINES" | awk 'NF {print "container=" $0}'
+printf '%s\n' "$RAW" | awk 'NF'

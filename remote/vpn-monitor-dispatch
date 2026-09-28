@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Forced command for the vpnmon SSH key. Only these exact commands are allowed.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+case "${SSH_ORIGINAL_COMMAND:-}" in
+  snapshot)
+    exec sudo -n /usr/local/sbin/vpn-monitor-snapshot
+    ;;
+  speedtest)
+    exec sudo -n /usr/local/sbin/vpn-monitor-speedtest
+    ;;
+  backup)
+    exec sudo -n /usr/local/sbin/vpn-monitor-backup
+    ;;
+  restart-vpn)
+    logger -t vpn-monitor "VPN container restart requested via monitoring key"
+    exec sudo -n /usr/local/sbin/vpn-monitor-restart-vpn
+    ;;
+  *)
+    echo "Command not allowed" >&2
+    exit 64
+    ;;
+esac

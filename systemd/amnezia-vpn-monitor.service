@@ -1,0 +1,40 @@
+[Unit]
+Description=Amnezia VPN Telegram Monitor
+Documentation=https://github.com/AndreyVorozhtsovJS/amnezia-vpn-monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vpnmonitor
+Group=vpnmonitor
+WorkingDirectory=/opt/amnezia-vpn-monitor
+EnvironmentFile=/opt/amnezia-vpn-monitor/.env
+ExecStart=/opt/amnezia-vpn-monitor/.venv/bin/python /opt/amnezia-vpn-monitor/app.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+StateDirectory=amnezia-vpn-monitor
+StateDirectoryMode=0750
+UMask=0077
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadOnlyPaths=/opt/amnezia-vpn-monitor
+ReadWritePaths=/var/lib/amnezia-vpn-monitor
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,33 @@
+# Secrets and real infrastructure configuration
+.env
+config.yaml
+keys/
+*.pem
+*.key
+
+# Runtime data
+*.db
+*.db-shm
+*.db-wal
+data/
+logs/
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/settings.json
+.idea/
+.DS_Store
+
+# Local leftovers / backups
+_old-version/
+backups/
+*.tar.gz.enc
+restore*/

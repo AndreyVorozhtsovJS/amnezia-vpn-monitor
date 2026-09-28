@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==22.8
+paramiko==5.0.0
+PyYAML==6.0.3
+python-dotenv==1.2.3

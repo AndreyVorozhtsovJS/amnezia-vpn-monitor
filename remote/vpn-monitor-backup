@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Streams a tar.gz of the Amnezia VPN configuration to stdout:
+#   <container>/opt-amnezia.tar.gz  - /opt/amnezia inside each Amnezia container
+#                                     (server keys, client list, protocol configs)
+#   <container>/inspect.json        - docker inspect (image, ports, env) to recreate it
+#   host/opt-amnezia-host.tar.gz    - /opt/amnezia on the host, if present
+# Contains PRIVATE KEYS. The monitor encrypts it before storing.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+umask 077
+
+command -v docker >/dev/null 2>&1 || { echo "docker_not_found" >&2; exit 2; }
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+
+found=0
+while read -r c; do
+  [ -n "$c" ] || continue
+  mkdir -p "$WORK/$c"
+  docker inspect "$c" > "$WORK/$c/inspect.json" 2>/dev/null || true
+  if docker exec "$c" sh -c 'test -d /opt/amnezia' 2>/dev/null; then
+    docker exec "$c" tar czf - -C / opt/amnezia > "$WORK/$c/opt-amnezia.tar.gz" 2>/dev/null || true
+  fi
+  found=1
+done < <(docker ps -a --format '{{.Names}}' | grep -Ei 'amnezia|awg|wireguard|openvpn|xray|cloak|shadowsocks|ipsec' || true)
+
+if [ -d /opt/amnezia ]; then
+  mkdir -p "$WORK/host"
+  tar czf "$WORK/host/opt-amnezia-host.tar.gz" -C / opt/amnezia 2>/dev/null || true
+  found=1
+fi
+
+[ "$found" = 1 ] || { echo "no_amnezia_found" >&2; exit 3; }
+date -u +%Y-%m-%dT%H:%M:%SZ > "$WORK/created_at"
+hostname > "$WORK/hostname"
+tar czf - -C "$WORK" .

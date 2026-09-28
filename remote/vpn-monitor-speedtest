@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Internet speed of this VPS. Prints JSON in speedtest-cli format.
+# Uses Ookla/speedtest-cli if installed, otherwise Cloudflare's speed endpoints
+# via curl (no installation needed).
+set -uo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+if command -v speedtest >/dev/null 2>&1 && speedtest --version 2>/dev/null | grep -qi ookla; then
+  exec speedtest --accept-license --accept-gdpr --format=json
+fi
+
+command -v curl >/dev/null 2>&1 || { echo '{"error":"curl_not_installed"}'; exit 2; }
+
+BASE="https://speed.cloudflare.com"
+DL_BYTES=50000000
+UL_BYTES=20000000
+
+# Latency: median of 5 small requests (time to first byte minus nothing heavy)
+PING="$(for _ in 1 2 3 4 5; do
+  curl -s -o /dev/null -m 5 -w '%{time_starttransfer}\n' "$BASE/__down?bytes=0"
+done | sort -n | awk '{a[NR]=$1} END {if (NR) printf "%.1f", a[int((NR+1)/2)]*1000; else print "0"}')"
+
+DL="$(curl -s -o /dev/null -m 60 -w '%{speed_download}' "$BASE/__down?bytes=$DL_BYTES" || echo 0)"
+UL="$(head -c "$UL_BYTES" /dev/zero | curl -s -o /dev/null -m 60 -w '%{speed_upload}' \
+      --data-binary @- -H 'Content-Type: application/octet-stream' "$BASE/__up" || echo 0)"
+
+awk -v dl="$DL" -v ul="$UL" -v p="$PING" 'BEGIN {
+  if (dl + 0 == 0 && ul + 0 == 0) { print "{\"error\":\"speedtest_failed\"}"; exit 1 }
+  printf "{\"download\": %.0f, \"upload\": %.0f, \"ping\": %s, \"server\": {\"sponsor\": \"Cloudflare\"}}\n", dl*8, ul*8, p
+}'

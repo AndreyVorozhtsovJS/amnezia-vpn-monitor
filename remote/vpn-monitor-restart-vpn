@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Restarts the Amnezia VPN protocol containers (AWG / WireGuard / OpenVPN /
+# XRay ...). Never touches other containers. Takes no arguments.
+set -euo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+VPN_PATTERN='awg|wireguard|openvpn|cloak|shadowsocks|xray|v2ray|ipsec'
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "error=docker_not_found"
+  exit 2
+fi
+
+mapfile -t TARGETS < <(docker ps -a --format '{{.Names}}' | grep -Ei "($VPN_PATTERN)" | grep -vi 'amnezia-dns' || true)
+if [ "${#TARGETS[@]}" -eq 0 ]; then
+  echo "error=no_vpn_containers"
+  exit 3
+fi
+
+rc=0
+for c in "${TARGETS[@]}"; do
+  if timeout 60 docker restart "$c" >/dev/null 2>&1; then
+    echo "restarted=$c"
+  else
+    echo "failed=$c"
+    rc=1
+  fi
+done
+sleep 3
+docker ps -a --format '{{.Names}}|{{.Status}}' | grep -Ei "^[^|]*($VPN_PATTERN)" | sed 's/^/container=/' || true
+exit "$rc"
