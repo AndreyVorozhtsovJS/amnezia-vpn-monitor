@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Security summary as key=value lines:
+#   f2b_banned_now / f2b_banned_total / failed_24h / journal_bytes
+#   login=<unix_ts>|<method>|<user>|<ip>   (successful SSH logins, last 26 h,
+#                                           the monitoring user excluded)
+set -uo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+JB=0
+for d in /var/log/journal /run/log/journal; do
+  [ -d "$d" ] && JB=$((JB + $(du -sb "$d" 2>/dev/null | awk '{print $1+0}')))
+done
+echo "journal_bytes=$JB"
+
+if command -v fail2ban-client >/dev/null 2>&1; then
+  ST="$(fail2ban-client status sshd 2>/dev/null)"
+  NOW_B="$(printf '%s\n' "$ST" | awk -F: '/Currently banned/{gsub(/ /,"",$2); print $2+0}')"
+  TOT_B="$(printf '%s\n' "$ST" | awk -F: '/Total banned/{gsub(/ /,"",$2); print $2+0}')"
+  echo "f2b_banned_now=${NOW_B:--1}"
+  echo "f2b_banned_total=${TOT_B:--1}"
+else
+  echo "f2b_banned_now=-1"
+  echo "f2b_banned_total=-1"
+fi
+
+SSHLOG="$(journalctl -q --since "26 hours ago" _COMM=sshd-session _COMM=sshd -o short-unix 2>/dev/null)"
+CUT=$(( $(date +%s) - 86400 ))
+echo "failed_24h=$(printf '%s\n' "$SSHLOG" | awk -v cut="$CUT" \
+  'int($1) >= cut && /Failed password|Invalid user|authentication failure/ {n++} END {print n+0}')"
+printf '%s\n' "$SSHLOG" | awk '/ Accepted / {
+  ts = int($1); m = ""; u = ""; ip = ""
+  for (i = 1; i <= NF; i++) {
+    if ($i == "Accepted") m = $(i+1)
+    if ($i == "for") u = $(i+1)
+    if ($i == "from") ip = $(i+1)
+  }
+  if (u != "vpnmon" && ip != "") print "login=" ts "|" m "|" u "|" ip
+}'

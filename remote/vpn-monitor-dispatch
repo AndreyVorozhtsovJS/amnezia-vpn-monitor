@@ -10,6 +10,15 @@ case "${SSH_ORIGINAL_COMMAND:-}" in
   speedtest)
     exec sudo -n /usr/local/sbin/vpn-monitor-speedtest
     ;;
+  security)
+    exec sudo -n /usr/local/sbin/vpn-monitor-security
+    ;;
+  reboot-if-idle)
+    exec sudo -n /usr/local/sbin/vpn-monitor-reboot-if-idle
+    ;;
+  reboot-now)
+    exec sudo -n /usr/local/sbin/vpn-monitor-reboot-now
+    ;;
   backup)
     exec sudo -n /usr/local/sbin/vpn-monitor-backup
     ;;

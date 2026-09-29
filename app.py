@@ -55,6 +55,7 @@ class Server:
     key_path: str
     traffic_limit_gb: float | None = None
     paid_until: dt.date | None = None
+    tz: Any = None  # employee's timezone (ZoneInfo); None = global timezone
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,8 @@ class Settings:
     traffic_limit_counts: str
     backup_time: dt.time | None
     backup_keep_days: int
+    auto_reboot_time: dt.time | None
+    auto_reboot_step_minutes: int
     history_retention_days: int
     known_hosts_path: str
     thresholds: Thresholds
@@ -95,6 +98,8 @@ BACKUP_PASSPHRASE = os.getenv("BACKUP_PASSPHRASE", "")
 BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(DB_PATH.parent / "backups"))).expanduser()
 LAST_HEARTBEAT: dict[str, Any] = {"at": None, "ok": None}
 LAST_BACKUP: dict[str, dict[str, Any]] = {}
+MAINTENANCE: dict[str, float] = {}          # server -> reboot expected until (ts)
+SECURITY: dict[str, dict[str, Any]] = {}    # server -> last security summary
 
 # Explicit path so the result does not depend on $HOME (sudo -u may keep root's HOME).
 DEFAULT_KNOWN_HOSTS = str(Path(__file__).resolve().parent / ".ssh" / "known_hosts")
@@ -189,6 +194,14 @@ def load_settings(config_path: str | Path) -> Settings:
             raise ConfigError("backup_time must look like 04:00 (or 'off')")
         backup_time = dt.time(int(m.group(1)), int(m.group(2)), tzinfo=tz)
     backup_keep = _as_int(raw.get("backup_keep_days", 14), "backup_keep_days", 1, 365)
+    reboot_raw = raw.get("auto_reboot_time", "04:30")
+    reboot_time: dt.time | None = None
+    if reboot_raw not in (None, "", False, "off"):
+        m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", str(reboot_raw).strip())
+        if not m:
+            raise ConfigError("auto_reboot_time must look like 04:30 (or 'off')")
+        reboot_time = dt.time(int(m.group(1)), int(m.group(2)), tzinfo=tz)
+    reboot_step = _as_int(raw.get("auto_reboot_step_minutes", 10), "auto_reboot_step_minutes", 1, 120)
     month_start = _as_int(raw.get("traffic_month_start_day", 1), "traffic_month_start_day", 1, 28)
     limit_counts = str(raw.get("traffic_limit_counts", "total")).strip().lower()
     if limit_counts not in ("total", "out", "in"):
@@ -227,6 +240,12 @@ def load_settings(config_path: str | Path) -> Settings:
         employee = str(item.get("employee", "")).strip()
         key_path = os.path.expanduser(str(item.get("key_path", "")).strip())
         port = _as_int(item.get("port", 22), f"{prefix}.port", 1, 65535)
+        srv_tz = None
+        if item.get("timezone"):
+            try:
+                srv_tz = ZoneInfo(str(item["timezone"]).strip())
+            except (ZoneInfoNotFoundError, ValueError) as exc:
+                raise ConfigError(f"{prefix}.timezone is unknown: {item['timezone']}") from exc
         paid_raw = item.get("paid_until")
         paid_until = None
         if paid_raw not in (None, ""):
@@ -265,6 +284,7 @@ def load_settings(config_path: str | Path) -> Settings:
                 key_path=key_path,
                 traffic_limit_gb=limit_gb,
                 paid_until=paid_until,
+                tz=srv_tz,
             )
         )
 
@@ -279,6 +299,8 @@ def load_settings(config_path: str | Path) -> Settings:
         traffic_limit_counts=limit_counts,
         backup_time=backup_time,
         backup_keep_days=backup_keep,
+        auto_reboot_time=reboot_time,
+        auto_reboot_step_minutes=reboot_step,
         history_retention_days=retention,
         known_hosts_path=known_hosts,
         thresholds=thresholds,
@@ -659,6 +681,20 @@ def init_db_blocking() -> None:
             "CREATE TABLE IF NOT EXISTS payments (server TEXT PRIMARY KEY, paid_until TEXT NOT NULL)"
         )
         conn.execute(
+            "CREATE TABLE IF NOT EXISTS reboot_log (ts REAL NOT NULL, server TEXT NOT NULL, "
+            "status TEXT NOT NULL, detail TEXT)"
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS known_ips (ip TEXT PRIMARY KEY, first_seen REAL NOT NULL)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS logins_seen (server TEXT NOT NULL, ts INTEGER NOT NULL, "
+            "ip TEXT NOT NULL, user TEXT, method TEXT, PRIMARY KEY (server, ts, ip))"
+        )
+        conn.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS peers_known (server TEXT NOT NULL, key TEXT NOT NULL, name TEXT, "
+            "first_seen REAL NOT NULL, missing INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (server, key))"
+        )
+        conn.execute(
             """
             CREATE TABLE IF NOT EXISTS traffic_limit_alerts (
                 server TEXT NOT NULL, period TEXT NOT NULL, level INTEGER NOT NULL,
@@ -940,7 +976,9 @@ def detail_text(result: dict[str, Any]) -> str:
     return (
         f"🟢 {result['name']}\n"
         f"Employee: {result.get('employee') or '—'}\n"
-        f"Host: {result['host']}\n\n"
+        f"Host: {result['host']}\n"
+        + local_time_line(result["name"])
+        + "\n"
         f"CPU: {result['cpu_pct']:.1f}%\n"
         + steal_line(result)
         + f"RAM: {result['mem_pct']:.1f}%\n"
@@ -958,6 +996,14 @@ def detail_text(result: dict[str, Any]) -> str:
         f"Active peers: {peers}"
         + ("\n\n⚠️ Reboot required (pending updates)" if result.get("reboot_required") else "")
     )
+
+
+def local_time_line(name: str) -> str:
+    srv = SERVER_MAP.get(name.lower())
+    if srv is None or srv.tz is None:
+        return ""
+    now = dt.datetime.now(srv.tz)
+    return f"Local time: {now.strftime('%H:%M')} ({srv.tz})\n"
 
 
 def steal_line(result: dict[str, Any]) -> str:
@@ -1130,6 +1176,7 @@ def server_keyboard(name: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🚀 Speed", callback_data=f"spd:{name}"),
                 InlineKeyboardButton("🔄 Restart VPN…", callback_data=f"rstask:{name}"),
             ],
+            [InlineKeyboardButton("⏻ Reboot server…", callback_data=f"rbask:{name}")],
         ]
     )
 
@@ -1183,6 +1230,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/speed vpn-01 — скорость интернета VPS\n"
         "/paid — даты оплаты VPS (/paid all 2027-09-14 — всем сразу)\n"
         "/backup — бэкап конфигурации Amnezia сейчас\n"
+        "/security — атаки, fail2ban, входы root\n"
+        "/reboot vpn-01 — перезагрузить сервер\n"
         "/health — состояние бота\n"
         "/servers — список серверов\n"
         "/chatid — ID этого чата\n\n"
@@ -1203,6 +1252,10 @@ def help_texts() -> list[str]:
         if st.daily_report_time else "выключена"
     )
     example = SERVERS[0].name if SERVERS else "vpn-01"
+    reboot_window = (
+        f"с {st.auto_reboot_time.strftime('%H:%M')}, шаг {st.auto_reboot_step_minutes} мин между серверами"
+        if st.auto_reboot_time else "выключено"
+    )
 
     guide = f"""📖 КАК РАБОТАЕТ МОНИТОРИНГ
 
@@ -1247,6 +1300,12 @@ def help_texts() -> list[str]:
 💳 /paid — до какого числа оплачен каждый VPS. После оплаты: /paid {example} 2026-11-15. За 5 дней и за 1 день до конца бот напомнит в утренней сводке.
 
 💾 Бэкап — каждую ночь бот забирает конфигурацию Amnezia (ключи сервера и список клиентов) со всех серверов, шифрует паролем и хранит {st.backup_keep_days} дн. на сервере мониторинга. /backup — сделать сейчас. Восстановление — docs/RESTORE.md.
+
+🔁 Автоперезагрузка — если сервер ждёт перезагрузки после обновлений, бот ночью ({reboot_window}, по местному времени сотрудника) проверяет: нет активных пользователей → перезагружает (без ложного 🔴, потом пишет «rebooted»); есть пользователь → переносит на следующую ночь. /reboot {example} — вручную, с подтверждением.
+
+👥 Новые клиенты — если на сервере появится новое устройство (кто-то создал ещё один ключ в Amnezia) или клиент будет удалён, придёт алерт 👥 с его именем.
+
+🔐 /security — сколько попыток подбора пароля было за сутки, сколько IP заблокировал fail2ban, последние входы root. Если root зайдёт с нового, ни разу не виденного адреса — сразу придёт алерт 🔐.
 
 🐕 Внешний сторож — если сам бот или сервер мониторинга упадёт, healthchecks.io пришлёт уведомление (статус: /health).
 
@@ -1450,6 +1509,25 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer()
         detail = await asyncio.to_thread(traffic_detail_blocking, server.name)
         await safe_edit(query, traffic_detail_text(server, detail), server_keyboard(server.name))
+    elif action == "rbask":
+        await query.answer()
+        await safe_edit(query, reboot_question(server), reboot_keyboard(server.name))
+    elif action == "rbok":
+        if server.name in MAINTENANCE:
+            await query.answer("Перезагрузка уже идёт", show_alert=True)
+            return
+        await query.answer("Перезагружаю…")
+        MAINTENANCE[server.name] = time.time() + 600
+        user = update.effective_user
+        log.warning("Manual reboot of %s requested by %s", server.name, user.id if user else "?")
+        data = await asyncio.to_thread(reboot_blocking, server, "reboot-now")
+        if data.get("status") == "rebooting":
+            await asyncio.to_thread(log_reboot, server.name, "rebooting", "manual")
+            await safe_edit(query, f"🔁 {server.name} перезагружается. Сообщу, когда вернётся (1–2 мин).", None)
+        else:
+            MAINTENANCE.pop(server.name, None)
+            await safe_edit(query, f"❌ {server.name}: не удалось перезагрузить\n{data.get('error', data)}",
+                            server_keyboard(server.name))
     elif action == "rstask":
         await query.answer()
         await safe_edit(query, restart_question(server), restart_keyboard(server.name))
@@ -1672,6 +1750,16 @@ async def process_alerts(context: ContextTypes.DEFAULT_TYPE, results: list[dict[
     for result in results:
         name = result["name"]
         who = f" ({result.get('employee')})" if result.get("employee") else ""
+        until = MAINTENANCE.get(name)
+        if until is not None:
+            if result.get("online") and (result.get("uptime_seconds") or 10**9) < 900:
+                MAINTENANCE.pop(name, None)
+                ALERT_TRACKER.pop(f"{name}:offline", None)
+                await send(f"🔁 {name}{who} rebooted, updates applied. VPN: {result.get('vpn_status')}")
+                continue
+            if time.time() < until:
+                continue  # planned reboot in progress: no OFFLINE alert
+            MAINTENANCE.pop(name, None)  # took too long -> normal alerting resumes
         if result.get("online"):
             checks = {"offline": (False, "")} | alert_conditions(result)
         else:
@@ -1758,6 +1846,12 @@ async def build_report() -> str:
             pl = payment_line(srv_obj, await asyncio.to_thread(paid_until_for, srv_obj))
             if pl:
                 extras.append(pl)
+        rl = await asyncio.to_thread(reboot_status_line, r["name"])
+        if rl:
+            lines.append("   " + rl)
+        sl = security_line(r["name"])
+        if sl:
+            lines.append("   " + sl)
         bl = backup_status_line(r["name"])
         if bl:
             extras.append(("💾 " if "ok" in bl else "❌ ") + bl)
@@ -1998,6 +2092,287 @@ async def payment_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
             log.exception("Failed to send payment reminder")
 
 
+# ---------------------------------------------------------------- VPN client changes
+PEER_REMOVE_AFTER = 3  # consecutive snapshots without the client before "removed"
+
+
+def peer_changes_blocking(result: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """Compare the server's client list with the stored one. Returns (added, removed) names."""
+    server = result["name"]
+    peers = result.get("peers") or []
+    if result.get("peers_total", -1) < 0 or (not peers and result.get("peers_total", 0) != 0):
+        return [], []  # no reliable data (container down, tools missing)
+    current = {p["key"]: p.get("name") or p["key"][:8] for p in peers}
+    added: list[str] = []
+    removed: list[str] = []
+    with _db_connect() as conn:
+        rows = conn.execute(
+            "SELECT key, name, missing FROM peers_known WHERE server = ?", (server,)
+        ).fetchall()
+        first_time = not rows and not conn.execute(
+            "SELECT 1 FROM meta WHERE key = ?", (f"peers_seeded:{server}",)
+        ).fetchone()
+        known = {k: (n, m) for k, n, m in rows}
+        for key, name in current.items():
+            if key not in known:
+                conn.execute(
+                    "INSERT INTO peers_known(server, key, name, first_seen, missing) VALUES (?, ?, ?, ?, 0)",
+                    (server, key, name, time.time()),
+                )
+                if not first_time:
+                    added.append(name)
+            elif known[key][1] or known[key][0] != name:
+                conn.execute("UPDATE peers_known SET name = ?, missing = 0 WHERE server = ? AND key = ?",
+                             (name, server, key))
+        for key, (name, missing) in known.items():
+            if key in current:
+                continue
+            if missing + 1 >= PEER_REMOVE_AFTER:
+                conn.execute("DELETE FROM peers_known WHERE server = ? AND key = ?", (server, key))
+                removed.append(name)
+            else:
+                conn.execute("UPDATE peers_known SET missing = missing + 1 WHERE server = ? AND key = ?",
+                             (server, key))
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, '1')", (f"peers_seeded:{server}",))
+    return added, removed
+
+
+async def check_peer_changes(context: ContextTypes.DEFAULT_TYPE, results: list[dict[str, Any]]) -> None:
+    for r in results:
+        if not r.get("online"):
+            continue
+        added, removed = await asyncio.to_thread(peer_changes_blocking, r)
+        if not (added or removed) or not ALERT_CHAT_ID:
+            continue
+        who = f" ({r.get('employee')})" if r.get("employee") else ""
+        lines = [f"👥 {r['name']}{who}: изменился список VPN-клиентов"]
+        lines += [f"➕ добавлен: {n}" for n in added]
+        lines += [f"➖ удалён: {n}" for n in removed]
+        lines.append(f"Сейчас клиентов: {r.get('peers_total')} · /peers {r['name']}")
+        try:
+            await context.bot.send_message(chat_id=int(ALERT_CHAT_ID), text="\n".join(lines))
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to send peer change alert")
+
+
+# ---------------------------------------------------------------- reboots
+def log_reboot(server: str, status: str, detail: str = "") -> None:
+    with _db_connect() as conn:
+        conn.execute("INSERT INTO reboot_log(ts, server, status, detail) VALUES (?, ?, ?, ?)",
+                     (time.time(), server, status, detail))
+
+
+def postponed_nights(server: str) -> int:
+    with _db_connect() as conn:
+        rows = conn.execute(
+            "SELECT status FROM reboot_log WHERE server = ? AND status IN ('postponed','rebooting') "
+            "ORDER BY ts DESC LIMIT 30", (server,)
+        ).fetchall()
+    n = 0
+    for (status,) in rows:
+        if status != "postponed":
+            break
+        n += 1
+    return n
+
+
+def reboot_blocking(server: Server, command: str) -> dict[str, str]:
+    try:
+        out, err, code = ssh_run(server, command, timeout=90)
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "error": str(exc)}
+    data = parse_kv(out)
+    if code != 0 and "status" not in data:
+        data = {"status": "error", "error": err.strip() or f"exit {code}"}
+    return data
+
+
+async def auto_reboot_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Nightly: reboot a server with pending updates only if nobody is using the VPN."""
+    server = SERVER_MAP.get(str(context.job.data).lower()) if context.job else None
+    if server is None:
+        return
+    if server.name in MAINTENANCE:
+        return
+    result = await collect_one(server)
+    if not result.get("online") or not result.get("reboot_required"):
+        return
+    if result.get("peers_online", -1) != 0:
+        n = await asyncio.to_thread(postponed_nights, server.name) + 1
+        await asyncio.to_thread(log_reboot, server.name, "postponed",
+                                f"{result.get('peers_online')} user(s) online")
+        log.info("Auto reboot of %s postponed (%s users online, night %d)",
+                 server.name, result.get("peers_online"), n)
+        return
+    MAINTENANCE[server.name] = time.time() + 600
+    data = await asyncio.to_thread(reboot_blocking, server, "reboot-if-idle")
+    status = data.get("status", "error")
+    if status != "rebooting":
+        MAINTENANCE.pop(server.name, None)
+        detail = data.get("users_online") and f"{data['users_online']} user(s) online" or data.get("error", status)
+        await asyncio.to_thread(log_reboot, server.name,
+                                "postponed" if status == "postponed" else status, detail)
+        return
+    await asyncio.to_thread(log_reboot, server.name, "rebooting", "auto, 0 users")
+    log.warning("Auto reboot of %s started (pending updates, no active users)", server.name)
+
+
+def reboot_status_line(server: str) -> str | None:
+    since = time.time() - 26 * 3600
+    with _db_connect() as conn:
+        row = conn.execute(
+            "SELECT ts, status, detail FROM reboot_log WHERE server = ? AND ts >= ? ORDER BY ts DESC LIMIT 1",
+            (server, since),
+        ).fetchone()
+    if not row:
+        return None
+    ts, status, detail = row
+    when = dt.datetime.fromtimestamp(ts, local_now().tzinfo).strftime("%H:%M")
+    if status == "rebooting":
+        return f"🔁 rebooted {when} (updates applied)"
+    if status == "postponed":
+        return f"⏸ reboot postponed: {detail} (night {postponed_nights(server)})"
+    return f"❌ auto reboot failed: {detail}"
+
+
+async def cmd_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    server = await server_from_args(update, context, "/reboot vpn-01")
+    if not server:
+        return
+    await update.effective_message.reply_text(reboot_question(server), reply_markup=reboot_keyboard(server.name))
+
+
+def reboot_question(server: Server) -> str:
+    cached = CACHE.get(server.name) or {}
+    users = cached.get("peers_online")
+    warn = f"\n⚠️ Сейчас активных пользователей: {users}" if isinstance(users, int) and users > 0 else ""
+    return (f"Перезагрузить сервер {server.name} ({server.employee or server.host})?\n"
+            f"VPN будет недоступен 1–2 минуты.{warn}")
+
+
+def reboot_keyboard(name: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Да, перезагрузить", callback_data=f"rbok:{name}"),
+        InlineKeyboardButton("✖ Отмена", callback_data=f"srv:{name}"),
+    ]])
+
+
+# ---------------------------------------------------------------- security
+def security_blocking(server: Server) -> dict[str, Any]:
+    out, err, code = ssh_run(server, "security", timeout=60)
+    if code != 0:
+        raise RuntimeError(err.strip() or f"exit {code}")
+    data: dict[str, Any] = {"logins": []}
+    for line in out.splitlines():
+        key, _, value = line.partition("=")
+        if key == "login":
+            parts = value.split("|")
+            if len(parts) == 4 and parts[0].isdigit():
+                data["logins"].append({"ts": int(parts[0]), "method": parts[1], "user": parts[2], "ip": parts[3]})
+        elif key:
+            try:
+                data[key] = int(value)
+            except ValueError:
+                data[key] = value
+    data["at"] = time.time()
+    return data
+
+
+def record_logins_blocking(server: str, logins: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Store logins; return those from IPs never seen before (after the initial seeding)."""
+    new_alerts = []
+    with _db_connect() as conn:
+        seeded = conn.execute("SELECT value FROM meta WHERE key = 'ips_seeded'").fetchone()
+        for lg in logins:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO logins_seen(server, ts, ip, user, method) VALUES (?, ?, ?, ?, ?)",
+                (server, lg["ts"], lg["ip"], lg["user"], lg["method"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            known = conn.execute("SELECT 1 FROM known_ips WHERE ip = ?", (lg["ip"],)).fetchone()
+            if not known:
+                conn.execute("INSERT OR IGNORE INTO known_ips(ip, first_seen) VALUES (?, ?)", (lg["ip"], time.time()))
+                if seeded:
+                    new_alerts.append(lg)
+    return new_alerts
+
+
+async def security_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    alerts: list[str] = []
+    for srv in SERVERS:
+        if srv.name in MAINTENANCE:
+            continue
+        try:
+            data = await asyncio.to_thread(security_blocking, srv)
+        except Exception as exc:  # noqa: BLE001
+            log.info("Security check failed for %s: %s", srv.name, exc)
+            continue
+        SECURITY[srv.name] = data
+        for lg in await asyncio.to_thread(record_logins_blocking, srv.name, data["logins"]):
+            when = dt.datetime.fromtimestamp(lg["ts"], local_now().tzinfo).strftime("%d.%m %H:%M")
+            alerts.append(f"🔐 {srv.name} ({srv.employee}): вход {lg['user']} с НОВОГО адреса {lg['ip']}\n"
+                          f"   {when}, способ: {lg['method']}")
+
+    def seed() -> None:
+        with _db_connect() as conn:
+            conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('ips_seeded', '1')")
+    await asyncio.to_thread(seed)
+    if alerts and ALERT_CHAT_ID:
+        text = ("\n\n".join(alerts)
+                + "\n\nЕсли это ты или сотрудник — всё в порядке, адрес запомнен. "
+                  "Если нет — срочно смени пароль root на этом сервере.")
+        try:
+            await context.bot.send_message(chat_id=int(ALERT_CHAT_ID), text=text)
+        except Exception:  # noqa: BLE001
+            log.exception("Failed to send security alert")
+
+
+def security_line(name: str) -> str | None:
+    d = SECURITY.get(name)
+    if not d:
+        return None
+    parts = []
+    if d.get("f2b_banned_now", -1) >= 0:
+        parts.append(f"🛡 banned {d['f2b_banned_now']}")
+    else:
+        parts.append("🛡 fail2ban OFF")
+    parts.append(f"attacks 24h {d.get('failed_24h', 0)}")
+    jb = d.get("journal_bytes", 0)
+    if isinstance(jb, int) and jb > 200 * 1024**2:
+        parts.append(f"⚠️ journal {human_bytes(jb)}")
+    return " · ".join(parts)
+
+
+async def cmd_security(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    msg = await update.effective_message.reply_text("🔐 Проверяю безопасность…")
+    await security_job(context)
+
+    def known() -> set[str]:
+        with _db_connect() as conn:
+            return {r[0] for r in conn.execute("SELECT ip FROM known_ips")}
+    known_ips = await asyncio.to_thread(known)
+    lines = ["🔐 Безопасность (за 24 ч)", ""]
+    for srv in SERVERS:
+        d = SECURITY.get(srv.name)
+        if not d:
+            lines.append(f"{srv.name}: нет данных")
+            continue
+        f2b = ("fail2ban не установлен ⚠️" if d.get("f2b_banned_now", -1) < 0
+               else f"заблокировано сейчас {d['f2b_banned_now']} (всего {d.get('f2b_banned_total', 0)})")
+        lines.append(f"{srv.name}: попыток подбора {d.get('failed_24h', 0)} · {f2b}")
+        for lg in sorted(d["logins"], key=lambda x: x["ts"], reverse=True)[:3]:
+            when = dt.datetime.fromtimestamp(lg["ts"], local_now().tzinfo).strftime("%d.%m %H:%M")
+            mark = "" if lg["ip"] in known_ips else " 🆕"
+            lines.append(f"   вход {lg['user']} {when} с {lg['ip']} ({lg['method']}){mark}")
+    lines += ["", "Новый адрес входа root — придёт алерт 🔐"]
+    await msg.edit_text("\n".join(lines))
+
+
 async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     global LAST_POLL_AT
     try:
@@ -2005,6 +2380,7 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         await save_results(results)
         LAST_POLL_AT = time.time()
         await process_alerts(context, results)
+        await check_peer_changes(context, results)
         await check_traffic_limits(context)
         await send_heartbeat()
     except Exception:
@@ -2029,6 +2405,8 @@ async def post_init(application: Application) -> None:
             BotCommand("report", "Daily summary now"),
             BotCommand("traffic", "Traffic this month"),
             BotCommand("paid", "VPS payment dates"),
+            BotCommand("security", "SSH attacks, fail2ban, root logins"),
+            BotCommand("reboot", "Reboot a VPN server"),
             BotCommand("backup", "Backup Amnezia config now"),
             BotCommand("speed", "Run VPS Internet speed test"),
             BotCommand("health", "Bot health"),
@@ -2049,6 +2427,21 @@ async def post_init(application: Application) -> None:
         application.job_queue.run_daily(
             daily_report_job, time=SETTINGS.daily_report_time, name="daily-report"
         )
+    if SETTINGS.auto_reboot_time is not None:
+        # Night in the EMPLOYEE's timezone; servers sharing a timezone are staggered.
+        base = dt.datetime.combine(dt.date(2000, 1, 1), SETTINGS.auto_reboot_time.replace(tzinfo=None))
+        per_tz: dict[str, int] = {}
+        for srv in SERVERS:
+            tz = srv.tz or SETTINGS.tz
+            i = per_tz.get(str(tz), 0)
+            per_tz[str(tz)] = i + 1
+            t = (base + dt.timedelta(minutes=i * SETTINGS.auto_reboot_step_minutes)).time()
+            application.job_queue.run_daily(
+                auto_reboot_job, time=t.replace(tzinfo=tz),
+                data=srv.name, name=f"auto-reboot-{srv.name}",
+            )
+            log.info("Auto reboot window for %s: %s %s", srv.name, t.strftime("%H:%M"), tz)
+    application.job_queue.run_repeating(security_job, interval=600, first=90, name="security")
     if SETTINGS.backup_time is not None and BACKUP_PASSPHRASE:
         application.job_queue.run_daily(backup_job, time=SETTINGS.backup_time, name="backup")
     elif not BACKUP_PASSPHRASE:
@@ -2084,6 +2477,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("traffic", cmd_traffic))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("paid", cmd_paid))
+    app.add_handler(CommandHandler("reboot", cmd_reboot))
+    app.add_handler(CommandHandler("security", cmd_security))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("servers", cmd_servers))

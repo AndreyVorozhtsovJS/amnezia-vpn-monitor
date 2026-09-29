@@ -23,6 +23,8 @@ Production-oriented Telegram monitoring for multiple Amnezia VPN VPS servers.
 - VPS Internet speed test (Cloudflare, no extra install)
 - nightly **encrypted** backup of the Amnezia configuration ([docs/RESTORE.md](docs/RESTORE.md))
 - external dead-man's-switch heartbeat (Better Stack / healthchecks.io / Cronitor)
+- **smart nightly reboot** for pending OS updates: staggered per server, only when no VPN user is active, otherwise postponed to the next night; no false OFFLINE alert during the planned reboot
+- **security**: fail2ban + journald size limit installed automatically, alert on a root login from a never-seen IP, `/security` summary
 - inline buttons, built-in admin guide in Russian (`/help`)
 
 Telegram commands:
@@ -38,6 +40,8 @@ Telegram commands:
 /report              daily summary now
 /paid [all|vpn-01 YYYY-MM-DD]   VPS payment dates
 /backup [vpn-01]     backup Amnezia config now
+/security            SSH attacks, fail2ban, root logins
+/reboot vpn-01       reboot a server (with confirmation)
 /health              bot, watchdog and backup status
 /servers  /chatid  /help
 ```
@@ -64,6 +68,9 @@ Each VPN VPS gets a dedicated `vpnmon` user. The monitor's public key is install
 - `speedtest` — VPS Internet speed
 - `restart-vpn` — restart Amnezia protocol containers only
 - `backup` — stream the Amnezia configuration (encrypted by the monitor before storing)
+- `security` — fail2ban / SSH login summary (read-only)
+- `reboot-if-idle` — reboot only if updates are pending AND no VPN user is active (checked on the server itself)
+- `reboot-now` — manual reboot after confirmation in Telegram
 
 A root-owned dispatcher maps those exact strings to root-owned scripts, and `sudoers` allows `vpnmon` to run only those scripts. Anything else returns `Command not allowed`.
 

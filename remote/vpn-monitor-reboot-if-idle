@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Reboots ONLY if the OS asks for it (pending updates) AND no VPN client is
+# active (handshake within the last 3 minutes). Otherwise does nothing.
+set -uo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+if [ ! -f /var/run/reboot-required ]; then
+  echo "status=not_required"; exit 0
+fi
+ONLINE="$(/usr/local/sbin/vpn-monitor-snapshot 2>/dev/null | awk -F= '$1=="peers_online"{print $2}')"
+if [ "${ONLINE:-}" != "0" ]; then
+  echo "status=postponed"
+  echo "users_online=${ONLINE:-unknown}"
+  exit 0
+fi
+echo "status=rebooting"
+logger -t vpn-monitor "Automatic reboot for pending updates (no active VPN users)"
+systemd-run --quiet --on-active=5 --unit="vpn-monitor-reboot-$(date +%s)" /bin/systemctl reboot >/dev/null 2>&1 \
+  || { (sleep 5; systemctl reboot) >/dev/null 2>&1 & }
+exit 0

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Manual reboot requested from the monitor (after confirmation in Telegram).
+set -uo pipefail
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+echo "status=rebooting"
+logger -t vpn-monitor "Manual reboot requested via monitoring key"
+systemd-run --quiet --on-active=5 --unit="vpn-monitor-reboot-$(date +%s)" /bin/systemctl reboot >/dev/null 2>&1 \
+  || { (sleep 5; systemctl reboot) >/dev/null 2>&1 & }
+exit 0

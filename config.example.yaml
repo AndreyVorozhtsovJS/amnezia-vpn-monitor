@@ -15,6 +15,10 @@ traffic_limit_counts: total
 # Nightly encrypted Amnezia backups (needs BACKUP_PASSPHRASE in .env; "off" to disable)
 backup_time: "04:00"
 backup_keep_days: 14
+# Nightly reboot for pending OS updates, ONLY when no VPN user is active
+# (otherwise postponed to the next night). Servers are staggered by the step.
+auto_reboot_time: "04:30"
+auto_reboot_step_minutes: 10
 
 thresholds:
   cpu_pct: 90
@@ -35,3 +39,5 @@ servers:
     # traffic_limit_gb: 1000
     # Optional: VPS paid until (can also be set from Telegram: /paid vpn-01 2026-11-15)
     # paid_until: 2026-10-15
+    # Optional: employee's timezone (nightly reboot happens at night THERE)
+    # timezone: Asia/Novosibirsk
