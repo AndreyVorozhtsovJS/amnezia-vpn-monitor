@@ -8,7 +8,7 @@ PATH=/usr/sbin:/usr/bin:/sbin:/bin
 
 JB=0
 for d in /var/log/journal /run/log/journal; do
-  [ -d "$d" ] && JB=$((JB + $(du -sb "$d" 2>/dev/null | awk '{print $1+0}')))
+  [ -d "$d" ] && JB=$((JB + $(du -s --block-size=1 "$d" 2>/dev/null | awk '{print $1+0}')))
 done
 echo "journal_bytes=$JB"
 
