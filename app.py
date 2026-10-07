@@ -1176,7 +1176,10 @@ def server_keyboard(name: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🚀 Speed", callback_data=f"spd:{name}"),
                 InlineKeyboardButton("🔄 Restart VPN…", callback_data=f"rstask:{name}"),
             ],
-            [InlineKeyboardButton("⏻ Reboot server…", callback_data=f"rbask:{name}")],
+            [
+                InlineKeyboardButton("🇷🇺 Доступ из РФ", callback_data=f"ru:{name}"),
+                InlineKeyboardButton("⏻ Reboot server…", callback_data=f"rbask:{name}"),
+            ],
         ]
     )
 
@@ -1228,6 +1231,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/report — сводка за сутки\n"
         "/traffic — трафик за месяц (/traffic vpn-01 — по дням и устройствам)\n"
         "/speed vpn-01 — скорость интернета VPS\n"
+        "/rucheck vpn-01 — доступен ли сервер из России (блокировка РКН)\n"
         "/paid — даты оплаты VPS (/paid all 2027-09-14 — всем сразу)\n"
         "/backup — бэкап конфигурации Amnezia сейчас\n"
         "/security — атаки, fail2ban, входы root\n"
@@ -1295,6 +1299,8 @@ def help_texts() -> list[str]:
 
 🔄 /restart_vpn {example} — перезапускает только VPN-контейнер (сам сервер не перезагружается). Клиенты отключатся на 10–20 с и переподключатся сами. Всегда спрашивает подтверждение.
 
+🇷🇺 /rucheck {example} или кнопка «Доступ из РФ» — только по запросу. Сначала бот проверяет сам сервер (из NL); если он в порядке — просит узлы check-host.net в России открыть порт 22 сервера. Порт VPN никогда не проверяется. Все узлы ✅ → IP не заблокирован; все ❌ → похоже на блокировку IP. Блокировку протокола у отдельного провайдера не видит.
+
 🚀 /speed {example} или кнопка «Speed» — замер интернет-канала самого VPS через Cloudflare (~30 с, ~70 МБ трафика). Показывает, не упёрся ли сервер в канал хостера.
 
 💳 /paid — до какого числа оплачен каждый VPS. После оплаты: /paid {example} 2026-11-15. За 5 дней и за 1 день до конца бот напомнит в утренней сводке.
@@ -1311,7 +1317,7 @@ def help_texts() -> list[str]:
 
 ОГРАНИЧЕНИЯ
 • Считаются только клиенты AmneziaWG/WireGuard (не XRay/OpenVPN)
-• Бот не видит блокировку VPN у провайдера сотрудника — для этого смотри /peers (ниже)
+• Бот не видит блокировку VPN у провайдера сотрудника — для этого смотри /peers и /rucheck (ниже)
 • Бот отвечает только разрешённым чатам"""
 
     playbook = f"""🛠 ЧТО ДЕЛАТЬ, ЕСЛИ…
@@ -1320,7 +1326,7 @@ def help_texts() -> list[str]:
 1. /status — какой значок у сервера сотрудника?
    🔴 → сервер недоступен: панель хостера (включён ли, оплачен ли)
    🟠 → /restart_vpn <сервер>, через минуту проверь /status
-   🟢 → сервер в порядке, смотри шаг 2
+   🟢 → сервер в порядке: /rucheck <сервер> — не заблокирован ли IP в России, затем шаг 2
 2. /peers <сервер> — найди устройство сотрудника и попроси его нажать «Подключиться» в Amnezia, затем обнови (↻)
    🟢 обновилось «Ns ago» → туннель работает. Проблема на стороне клиента: конкретный сайт, DNS, приложение. Пусть переподключится или перезапустит Amnezia
    ⚪/🟡 не меняется → трафик не доходит до сервера. Попроси сменить сеть (Wi-Fi ↔ мобильный интернет). Если в одной сети работает, а в другой нет — VPN блокирует провайдер/сеть сотрудника
@@ -1505,6 +1511,17 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         async with lock:
             result = await asyncio.to_thread(speedtest_blocking, server)
         await safe_edit(query, speed_text(server, result), server_keyboard(server.name))
+    elif action == "ru":
+        if RU_CHECK_LOCK.locked():
+            await query.answer("Проверка из РФ уже идёт", show_alert=True)
+            return
+        await query.answer("Проверяю (~30–60 с)…")
+        await safe_edit(query, f"🇷🇺 {server.name}: проверяю сервер, затем доступность из России… (~30–60 с)", None)
+        user = update.effective_user
+        log.info("RU reachability check of %s requested by %s", server.name, user.id if user else "?")
+        async with RU_CHECK_LOCK:
+            text = await ru_check_text(server)
+        await safe_edit(query, text, server_keyboard(server.name))
     elif action == "traf":
         await query.answer()
         detail = await asyncio.to_thread(traffic_detail_blocking, server.name)
@@ -1675,6 +1692,152 @@ def speed_text(server: Server, result: dict[str, Any]) -> str:
         f"Test server: {result['server']}\n\n"
         "Это канал самого VPS, не скорость у сотрудника."
     )
+
+
+# ---------------------------------------------------------------- RU reachability
+# On-demand only (never scheduled): asks check-host.net nodes located in Russia
+# to open TCP port 22 of the server. Only the SSH port is probed - never the VPN
+# port - so the check reveals nothing that internet-wide scanners don't already see.
+CHECK_HOST_URL = "https://check-host.net"
+RU_CHECK_PORT = 22
+RU_CHECK_WAIT_SECONDS = 45
+RU_CHECK_LOCK = asyncio.Lock()
+
+
+async def ru_reachability(host: str) -> dict[str, Any]:
+    import httpx
+
+    async with httpx.AsyncClient(timeout=15, headers={"Accept": "application/json"}) as client:
+        resp = await client.get(f"{CHECK_HOST_URL}/nodes/hosts")
+        resp.raise_for_status()
+        ru_nodes: dict[str, str] = {}
+        for node, info in (resp.json().get("nodes") or {}).items():
+            loc = (info or {}).get("location") or []
+            if loc and str(loc[0]).lower() == "ru":
+                ru_nodes[node] = str(loc[2]) if len(loc) > 2 else node
+        if not ru_nodes:
+            return {"error": "check-host.net не вернул ни одного узла в России"}
+
+        params = [("host", f"{host}:{RU_CHECK_PORT}")] + [("node", n) for n in ru_nodes]
+        resp = await client.get(f"{CHECK_HOST_URL}/check-tcp", params=params)
+        resp.raise_for_status()
+        req = resp.json()
+        request_id = req.get("request_id")
+        if not req.get("ok") or not request_id:
+            return {"error": f"check-host.net отклонил запрос: {req.get('error') or req}"}
+        nodes = list((req.get("nodes") or {}).keys()) or list(ru_nodes)
+
+        results: dict[str, Any] = {}
+        deadline = time.monotonic() + RU_CHECK_WAIT_SECONDS
+        while time.monotonic() < deadline:
+            await asyncio.sleep(3)
+            try:
+                resp = await client.get(f"{CHECK_HOST_URL}/check-result/{request_id}")
+                if resp.status_code == 200:
+                    results = resp.json() or {}
+            except httpx.HTTPError:
+                continue
+            if all(results.get(n) is not None for n in nodes):
+                break
+
+    rows = []
+    for node in nodes:
+        city = ru_nodes.get(node, node)
+        short = node.split(".", 1)[0]
+        value = results.get(node)
+        item = value[0] if isinstance(value, list) and value else None
+        if isinstance(item, dict) and item.get("time") is not None:
+            rows.append({"node": f"{city} ({short})", "state": "ok",
+                         "detail": f"{float(item['time']) * 1000:.0f} ms"})
+        elif isinstance(item, dict) and item.get("error"):
+            rows.append({"node": f"{city} ({short})", "state": "fail", "detail": str(item["error"])})
+        else:
+            rows.append({"node": f"{city} ({short})", "state": "none", "detail": "нет ответа от узла"})
+    return {"rows": rows, "link": req.get("permanent_link")}
+
+
+async def ru_check_text(server: Server) -> str:
+    head = f"🇷🇺 {server.name} ({server.employee or server.host}) — доступность из России"
+    # Step 1: is the server itself fine? If not, it is not a block.
+    result = await collect_one(server)
+    CACHE[server.name] = result
+    if not result.get("online"):
+        return (f"{head}\n\n🔴 Сервер не отвечает и из Нидерландов: {result.get('error', '')}\n"
+                "Это проблема самого сервера, а не блокировка. Проверь панель хостера.\n"
+                "Проверка из РФ не запускалась.")
+    problem = vpn_problem(result)
+    if problem or not str(result.get("vpn_status", "")).startswith("Up"):
+        return (f"{head}\n\n🟠 Сервер работает, но VPN-контейнер нет: {problem or result.get('vpn_status')}\n"
+                f"Сначала /restart_vpn {server.name}. Проверка из РФ не запускалась.")
+    peers = result.get("peers_online", -1)
+    lines = [head, "", f"🟢 Сервер в порядке (из NL): VPN Up, онлайн {peers if peers >= 0 else '?'}", ""]
+
+    # Step 2: probe from Russian nodes.
+    try:
+        data = await ru_reachability(server.host)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("RU check failed for %s: %s", server.name, exc)
+        return "\n".join(lines + [f"❓ check-host.net недоступен: {exc}", "Повтори позже."])
+    if "error" in data:
+        return "\n".join(lines + [f"❓ {data['error']}", "Повтори позже."])
+
+    rows = data["rows"]
+    icon = {"ok": "✅", "fail": "❌", "none": "⏳"}
+    lines.append(f"Узлы в России, TCP-порт {RU_CHECK_PORT}:")
+    lines += [f"{icon[r['state']]} {r['node']} — {r['detail']}" for r in rows]
+    ok = sum(r["state"] == "ok" for r in rows)
+    answered = sum(r["state"] != "none" for r in rows)
+    lines.append("")
+    if answered == 0:
+        lines.append("❓ Узлы не ответили — повтори через пару минут.")
+    elif ok == answered:
+        lines.append(
+            f"✅ IP сервера открыт из России ({ok}/{answered}) — блокировки по IP нет.\n"
+            "Если у сотрудника не работает: смена сети (Wi-Fi ↔ мобильный), переподключение "
+            f"в Amnezia, /peers {server.name} — доходит ли рукопожатие. Блокировку протокола "
+            "у конкретного провайдера и «белые списки» мобильного интернета эта проверка не видит."
+        )
+    elif ok == 0:
+        lines.append(
+            f"🚫 Из России сервер недоступен ни с одного узла (0/{answered}), а из NL работает — "
+            "похоже на блокировку IP.\nПовтори через 10–15 мин для уверенности. Если подтвердится — "
+            "нужен новый IP: смена адреса у хостера или новый сервер + перенос ключей из бэкапа."
+        )
+    else:
+        lines.append(
+            f"⚠️ Доступен частично ({ok}/{answered}) — блокировка у части операторов или "
+            "сетевые проблемы. Повтори через 10–15 мин."
+        )
+    if data.get("link"):
+        lines.append(f"Отчёт: {data['link']}")
+    return "\n".join(lines)
+
+
+async def cmd_rucheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await ensure_authorized(update):
+        return
+    if not context.args:
+        buttons = [InlineKeyboardButton(f"🇷🇺 {x.name}", callback_data=f"ru:{x.name}") for x in SERVERS]
+        await update.effective_message.reply_text(
+            "Какой сервер проверить на доступность из России? (~30–60 с)",
+            reply_markup=InlineKeyboardMarkup([buttons[i : i + 2] for i in range(0, len(buttons), 2)]),
+        )
+        return
+    server = SERVER_MAP.get(context.args[0].lower())
+    if not server:
+        await update.effective_message.reply_text("Unknown server. Use /servers.")
+        return
+    if RU_CHECK_LOCK.locked():
+        await update.effective_message.reply_text("Проверка из РФ уже идёт, подожди минуту.")
+        return
+    msg = await update.effective_message.reply_text(
+        f"🇷🇺 {server.name}: проверяю сервер, затем доступность из России… (~30–60 с)"
+    )
+    user = update.effective_user
+    log.info("RU reachability check of %s requested by %s", server.name, user.id if user else "?")
+    async with RU_CHECK_LOCK:
+        text = await ru_check_text(server)
+    await msg.edit_text(text, reply_markup=server_keyboard(server.name))
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2406,6 +2569,7 @@ async def post_init(application: Application) -> None:
             BotCommand("traffic", "Traffic this month"),
             BotCommand("paid", "VPS payment dates"),
             BotCommand("security", "SSH attacks, fail2ban, root logins"),
+            BotCommand("rucheck", "Доступен ли сервер из России"),
             BotCommand("reboot", "Reboot a VPN server"),
             BotCommand("backup", "Backup Amnezia config now"),
             BotCommand("speed", "Run VPS Internet speed test"),
@@ -2479,6 +2643,7 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("paid", cmd_paid))
     app.add_handler(CommandHandler("reboot", cmd_reboot))
     app.add_handler(CommandHandler("security", cmd_security))
+    app.add_handler(CommandHandler("rucheck", cmd_rucheck))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(CommandHandler("health", cmd_health))
     app.add_handler(CommandHandler("servers", cmd_servers))

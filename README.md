@@ -41,6 +41,7 @@ Telegram commands:
 /paid [all|vpn-01 YYYY-MM-DD]   VPS payment dates
 /backup [vpn-01]     backup Amnezia config now
 /security            SSH attacks, fail2ban, root logins
+/rucheck [vpn-01]    Is the server reachable from Russia (on demand)
 /reboot vpn-01       reboot a server (with confirmation)
 /health              bot, watchdog and backup status
 /servers  /chatid  /help
@@ -216,6 +217,10 @@ ssh root@MONITOR_IP 'install -m 644 /root/amnezia-vpn-monitor/app.py /opt/amnezi
 ```
 
 Optional `.env` settings: `HEALTHCHECK_URL` (external watchdog), `BACKUP_PASSPHRASE` (nightly encrypted backups — keep a copy in a password manager).
+
+## About `/rucheck`
+
+On-demand only, never scheduled. The bot first checks the server itself from the monitor; only if it is healthy does it ask [check-host.net](https://check-host.net) nodes located in Russia to open TCP port 22 of the server. The VPN port is never probed. All nodes OK means the IP is not blocked; all failing while the monitor sees the server means a likely IP block. Protocol-level (DPI) blocking by a specific ISP is not detected.
 
 ## About `/speed`
 
