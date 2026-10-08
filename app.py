@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +21,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import paramiko
 import yaml
 from dotenv import load_dotenv
-from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, LinkPreviewOptions, Update
 from telegram.ext import (
     Application,
     ApplicationBuilder,
@@ -65,6 +66,8 @@ class Thresholds:
     disk_pct: float = 90.0
     packet_loss_pct: float = 10.0
     ping_ms: float = 200.0
+    steal_pct: float = 20.0      # hypervisor steal, averaged over steal_minutes
+    steal_minutes: int = 30
 
 
 @dataclass(frozen=True)
@@ -107,6 +110,7 @@ DEFAULT_KNOWN_HOSTS = str(Path(__file__).resolve().parent / ".ssh" / "known_host
 CACHE: dict[str, dict[str, Any]] = {}
 PREVIOUS_COUNTERS: dict[str, tuple[float, int, int]] = {}
 ALERT_TRACKER: dict[str, dict[str, Any]] = {}
+STEAL_WINDOW: dict[str, deque] = {}  # server -> deque[(ts, steal_pct)] for the steal alert
 SERVER_LOCKS: dict[str, asyncio.Lock] = {}
 SPEEDTEST_LOCKS: dict[str, asyncio.Lock] = {}
 RESTART_LOCKS: dict[str, asyncio.Lock] = {}
@@ -221,6 +225,8 @@ def load_settings(config_path: str | Path) -> Settings:
             traw.get("packet_loss_pct", 10), "thresholds.packet_loss_pct", 0, 100
         ),
         ping_ms=_as_float(traw.get("ping_ms", 200), "thresholds.ping_ms", 1, 10000),
+        steal_pct=_as_float(traw.get("steal_pct", 20), "thresholds.steal_pct", 1, 100),
+        steal_minutes=int(_as_float(traw.get("steal_minutes", 30), "thresholds.steal_minutes", 5, 720)),
     )
 
     sraw = raw.get("servers")
@@ -1284,6 +1290,7 @@ def help_texts() -> list[str]:
 🔴 OFFLINE — нет связи {st.alert_after_failures} проверки подряд (~{offline_after // 60} мин)
 🟠 VPN container DOWN — контейнер не работает {st.alert_after_failures} проверки подряд
 🟡 CPU / RAM / диск выше порога {st.resource_alert_after} проверок подряд (~{res_after // 60} мин)
+🟡 steal — хостер в среднем забирает ≥{t.steal_pct:.0f}% CPU за {t.steal_minutes} мин (соседи по физическому серверу). Отбой — когда упадёт ниже {t.steal_pct / 2:.0f}%. Повторяется — пиши хостеру
 🟢 отбой — когда проблема ушла
 Короткие всплески не будят — алерт только при устойчивой проблеме.
 
@@ -1564,9 +1571,12 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer()
 
 
+NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
+
+
 async def safe_edit(query: Any, text: str, markup: InlineKeyboardMarkup | None) -> None:
     try:
-        await query.edit_message_text(text, reply_markup=markup)
+        await query.edit_message_text(text, reply_markup=markup, link_preview_options=NO_PREVIEW)
     except Exception as exc:  # noqa: BLE001 - e.g. "message is not modified"
         if "not modified" not in str(exc).lower():
             log.warning("Could not edit message: %s", exc)
@@ -1837,7 +1847,7 @@ async def cmd_rucheck(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     log.info("RU reachability check of %s requested by %s", server.name, user.id if user else "?")
     async with RU_CHECK_LOCK:
         text = await ru_check_text(server)
-    await msg.edit_text(text, reply_markup=server_keyboard(server.name))
+    await msg.edit_text(text, reply_markup=server_keyboard(server.name), link_preview_options=NO_PREVIEW)
 
 
 async def cmd_health(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1875,12 +1885,45 @@ def alert_conditions(result: dict[str, Any]) -> dict[str, tuple[bool, str]]:
     assert SETTINGS is not None
     t = SETTINGS.thresholds
     vpn = vpn_problem(result)
-    return {
+    checks = {
         "vpn": (vpn is not None, f"VPN container is DOWN\n{vpn}" if vpn else ""),
         "cpu": (result["cpu_pct"] >= t.cpu_pct, f"high CPU {result['cpu_pct']:.0f}% (≥{t.cpu_pct:.0f}%)"),
         "mem": (result["mem_pct"] >= t.memory_pct, f"high RAM {result['mem_pct']:.0f}% (≥{t.memory_pct:.0f}%)"),
         "disk": (result["disk_pct"] >= t.disk_pct, f"disk almost full {result['disk_pct']:.0f}% (≥{t.disk_pct:.0f}%)"),
     }
+    steal = steal_condition(result)
+    if steal is not None:
+        checks["steal"] = steal
+    return checks
+
+
+def steal_condition(result: dict[str, Any]) -> tuple[bool, str] | None:
+    """Average hypervisor steal over the last `steal_minutes`. Single spikes are
+    ignored; alerts at avg >= threshold, clears only below half of it."""
+    assert SETTINGS is not None
+    t = SETTINGS.thresholds
+    steal = result.get("steal_pct")
+    if steal is None:
+        return None
+    now = result.get("checked_at")
+    if now is None:
+        now = time.time()
+    window = STEAL_WINDOW.setdefault(result["name"], deque())
+    window.append((now, float(steal)))
+    span = t.steal_minutes * 60
+    while window and window[0][0] < now - span:
+        window.popleft()
+    expected = span / max(SETTINGS.poll_interval_seconds, 1)
+    if len(window) < expected * 0.8:
+        return None  # not enough data yet (e.g. right after a bot restart)
+    avg = sum(v for _, v in window) / len(window)
+    alerted = ALERT_TRACKER.get(f"{result['name']}:steal", {}).get("alerted", False)
+    bad = avg >= (t.steal_pct / 2 if alerted else t.steal_pct)
+    return bad, (
+        f"хостер забирает CPU — steal в среднем {avg:.0f}% за {t.steal_minutes} мин "
+        f"(порог {t.steal_pct:.0f}%)\nVPN может тормозить. Если повторяется — напиши хостеру "
+        "и попроси перенести сервер на другой узел."
+    )
 
 
 RECOVERY_TEXT = {
@@ -1889,6 +1932,7 @@ RECOVERY_TEXT = {
     "cpu": "CPU back to normal",
     "mem": "RAM back to normal",
     "disk": "disk usage back to normal",
+    "steal": "host steal back to normal",
 }
 
 
@@ -1941,7 +1985,8 @@ async def process_alerts(context: ContextTypes.DEFAULT_TYPE, results: list[dict[
                 continue
             state["count"] += 1
             needed = (
-                SETTINGS.resource_alert_after
+                1 if kind == "steal"  # already averaged over steal_minutes
+                else SETTINGS.resource_alert_after
                 if kind in ("cpu", "mem", "disk")
                 else SETTINGS.alert_after_failures
             )
@@ -1950,6 +1995,8 @@ async def process_alerts(context: ContextTypes.DEFAULT_TYPE, results: list[dict[
                     text = f"🔴 {name}{who} is OFFLINE\nFailed checks: {state['count']}\n{description}"
                 elif kind == "vpn":
                     text = f"🟠 {name}{who}: {description}\n\nFix: /restart_vpn {name}"
+                elif kind == "steal":
+                    text = f"🟡 {name}{who}: {description}"
                 else:
                     text = f"🟡 {name}{who}: {description} for {state['count']} checks in a row"
                 state["alerted"] = await send(text)

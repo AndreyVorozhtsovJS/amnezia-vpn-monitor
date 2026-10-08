@@ -26,6 +26,10 @@ thresholds:
   disk_pct: 90
   packet_loss_pct: 10
   ping_ms: 200
+  # Hypervisor steal (CPU taken by other tenants of the physical host),
+  # averaged over steal_minutes. Short spikes are ignored.
+  steal_pct: 20
+  steal_minutes: 30
 
 # Start with one server. Duplicate this block when vpn-01 is working.
 servers:

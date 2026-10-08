@@ -218,6 +218,10 @@ ssh root@MONITOR_IP 'install -m 644 /root/amnezia-vpn-monitor/app.py /opt/amnezi
 
 Optional `.env` settings: `HEALTHCHECK_URL` (external watchdog), `BACKUP_PASSPHRASE` (nightly encrypted backups — keep a copy in a password manager).
 
+## Host steal alert
+
+Steal is CPU time the hypervisor gives to other tenants of the same physical host. The bot averages it over `thresholds.steal_minutes` (default 30) and sends 🟡 when the average reaches `thresholds.steal_pct` (default 20%); it clears only when the average drops below half of the threshold. Short spikes in the daily report do not trigger it. If it keeps firing, ask the hoster to move the VPS to another node.
+
 ## About `/rucheck`
 
 On-demand only, never scheduled. The bot first checks the server itself from the monitor; only if it is healthy does it ask [check-host.net](https://check-host.net) nodes located in Russia to open TCP port 22 of the server. The VPN port is never probed. All nodes OK means the IP is not blocked; all failing while the monitor sees the server means a likely IP block. Protocol-level (DPI) blocking by a specific ISP is not detected.
